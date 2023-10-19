@@ -14,6 +14,7 @@ target/
 
 # where account and keys are stored
 *.json
+config.toml
 # except for example json file used for testing
 !nomnomnom.testnet.json
 !37cb5b936de257d014e663663b186e58e4c3c4c9b4c7643e7b89821e789b0b4b.json
