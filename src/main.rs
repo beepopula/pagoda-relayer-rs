@@ -1,7 +1,5 @@
 mod error;
 mod rpc_conf;
-mod shared_storage;
-mod redis_fns;
 
 use axum::{
     extract::Json,
@@ -28,15 +26,11 @@ use near_primitives::transaction::{Action, FunctionCallAction};
 use near_primitives::types::{BlockHeight, Nonce};
 use near_primitives::types::AccountId;
 use once_cell::sync::Lazy;
-use r2d2::{Pool, PooledConnection};
-use r2d2_redis::redis::{Commands, ErrorKind::IoError, RedisError};
-use r2d2_redis::RedisConnectionManager;
 use serde::Deserialize;
 use serde_json::json;
 use std::{fmt, path::Path};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::string::ToString;
 #[cfg(test)]
 use axum::body::{BoxBody, HttpBody};
@@ -54,12 +48,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::RelayError;
 use crate::rpc_conf::NetworkConfig;
-use crate::shared_storage::SharedStoragePoolManager;
 
 
-// transaction cost in Gas (10^21yN or 10Tgas or 0.001N)
-const TXN_GAS_ALLOWANCE: u64 = 10_000_000_000_000;
-const YN_TO_GAS: u128 = 1_000_000_000;
 
 // load config from toml and setup json rpc client
 static LOCAL_CONF: Lazy<Config> = Lazy::new(|| {
@@ -83,9 +73,6 @@ static PORT: Lazy<u16> = Lazy::new(|| { LOCAL_CONF.get("port").unwrap() });
 static RELAYER_ACCOUNT_ID: Lazy<String> = Lazy::new(|| {
     LOCAL_CONF.get("relayer_account_id").unwrap()
 });
-static SHARED_STORAGE_ACCOUNT_ID: Lazy<String> = Lazy::new(|| {
-    LOCAL_CONF.get("shared_storage_account_id").unwrap()
-});
 static SIGNER: Lazy<KeyRotatingSigner> = Lazy::new(|| {
     let paths = LOCAL_CONF.get::<Vec<String>>("keys_filenames")
         .expect("Failed to read 'keys_filenames' from config");
@@ -94,48 +81,11 @@ static SIGNER: Lazy<KeyRotatingSigner> = Lazy::new(|| {
             .unwrap_or_else(|err| panic!("failed to read signing keys from {path}: {err:?}"))
     }))
 });
-static SHARED_STORAGE_KEYS_FILENAME: Lazy<String> = Lazy::new(|| {
-    LOCAL_CONF.get("shared_storage_keys_filename").unwrap()
-});
-static WHITELISTED_CONTRACTS: Lazy<Vec<String>> = Lazy::new(|| {
-    LOCAL_CONF.get("whitelisted_contracts").unwrap()
-});
-static USE_WHITELISTED_DELEGATE_ACTION_RECEIVER_IDS: Lazy<bool> = Lazy::new(|| {
-    LOCAL_CONF.get("use_whitelisted_delegate_action_receiver_ids").unwrap_or(false)
-});
-static WHITELISTED_DELEGATE_ACTION_RECEIVER_IDS: Lazy<Vec<String>> = Lazy::new(|| {
-    LOCAL_CONF.get("whitelisted_delegate_action_receiver_ids").unwrap()
-});
-static USE_REDIS: Lazy<bool> = Lazy::new(|| {
-    LOCAL_CONF.get("use_redis").unwrap_or(false)
-});
-static REDIS_POOL: Lazy<Pool<RedisConnectionManager>> = Lazy::new(|| {
-    let redis_cnxn_url: String = LOCAL_CONF.get("redis_url").unwrap();
-    let manager = RedisConnectionManager::new(redis_cnxn_url).unwrap();
-    Pool::builder().build(manager).unwrap()
-});
-static USE_FASTAUTH_FEATURES: Lazy<bool> = Lazy::new(|| {
-    LOCAL_CONF.get("use_fastauth_features").unwrap_or(false)
-});
 static USE_PAY_WITH_FT: Lazy<bool> = Lazy::new(|| {
    LOCAL_CONF.get("use_pay_with_ft").unwrap_or(false)
 });
 static BURN_ADDRESS: Lazy<String> = Lazy::new(||{
    LOCAL_CONF.get("burn_address").unwrap()
-});
-static USE_SHARED_STORAGE: Lazy<bool> = Lazy::new(|| {
-    LOCAL_CONF.get("use_shared_storage").unwrap_or(false)
-});
-static SHARED_STORAGE_POOL: Lazy<SharedStoragePoolManager> = Lazy::new(|| {
-    let social_db_id: String = LOCAL_CONF.get("social_db_contract_id").unwrap();
-    let signer = InMemorySigner::from_file(Path::new(SHARED_STORAGE_KEYS_FILENAME.as_str()))
-        .unwrap_or_else(|err| panic!("failed to get signing keys={SHARED_STORAGE_KEYS_FILENAME:?}: {err:?}"));
-    SharedStoragePoolManager::new(
-        signer,
-        &RPC_CLIENT,
-        social_db_id.parse().unwrap(),
-        SHARED_STORAGE_ACCOUNT_ID.parse().unwrap(),
-    )
 });
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -224,18 +174,6 @@ async fn main() {
     // initialize tracing (aka logging)
     tracing_subscriber::registry().with(tracing_subscriber::fmt::layer()).init();
 
-    // initialize our shared storage pool manager if using fastauth features or using shared storage
-    if USE_FASTAUTH_FEATURES.clone() || USE_SHARED_STORAGE.clone() {
-        if let Err(err) = SHARED_STORAGE_POOL.check_and_spawn_pool().await {
-            let err_msg = format!("Error initializing shared storage pool: {err}");
-            error!("{err_msg}");
-            tracing::error!(err_msg);
-            return;
-        } else {
-            info!("shared storage pool initialized")
-        }
-    }
-
     //TODO: not secure, allow only for testnet, whitelist endpoint etc. for mainnet
     let cors_layer = tower_http::cors::CorsLayer::permissive();
 
@@ -253,10 +191,6 @@ async fn main() {
             relay,
             send_meta_tx,
             create_account_atomic,
-            get_allowance,
-            update_allowance,
-            update_all_allowances,
-            register_account_and_allowance,
         ),
         components(
             schemas(
@@ -289,10 +223,6 @@ async fn main() {
         .route("/relay", post(relay))
         .route("/send_meta_tx", post(send_meta_tx))
         .route("/create_account_atomic", post(create_account_atomic))
-        .route("/get_allowance", get(get_allowance))
-        .route("/update_allowance", post(update_allowance))
-        .route("/update_all_allowances", post(update_all_allowances))
-        .route("/register_account", post(register_account_and_allowance))
         // See https://docs.rs/tower-http/0.1.1/tower_http/trace/index.html for more details.
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer);
@@ -305,40 +235,6 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
-}
-
-// NOTE: error in swagger-ui TypeError: Failed to execute 'fetch' on 'Window': Request with GET/HEAD method cannot have body.
-#[utoipa::path(
-    get,
-    path = "/get_allowance",
-    request_body = AccountIdJson,
-    responses(
-        (status = 200, description = "90000000000000", body = String),
-        (status = 500, description = "Error getting allowance for account_id example.near in Relayer DB: err_msg", body = String)
-    )
-)]
-async fn get_allowance(account_id_json: Json<AccountIdJson>) -> impl IntoResponse {
-    // convert str account_id val from json to AccountId so I can reuse get_remaining_allowance fn
-    let Ok(account_id_val) = AccountId::from_str(&account_id_json.account_id) else {
-        return (StatusCode::FORBIDDEN, format!("Invalid account_id: {}", account_id_json.account_id)).into_response();
-    };
-    match redis_fns::get_remaining_allowance(&account_id_val).await {
-        Ok(allowance) => (
-            StatusCode::OK,
-            allowance.to_string()  // TODO: LP return in json format
-            // AllowanceJson {
-            //     allowance_in_gas: allowance
-            // }
-        ).into_response(),
-        Err(err) => {
-            let err_msg = format!(
-                "Error getting allowance for account_id {} in Relayer DB: {:?}",
-                account_id_val.clone().as_str(), err
-            );
-            error!("{err_msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
-        }
-    }
 }
 
 
@@ -378,46 +274,6 @@ async fn create_account_atomic(
     let sda: SignedDelegateAction = account_id_allowance_oauth_sda.signed_delegate_action.clone();
 
     /*
-        do logic similar to register_account_and_allowance fn
-        without updating redis or allocating shared storage
-        if that fails, return error
-        if it succeeds, then continue
-     */
-
-    // check if the oauth_token has already been used and is a key in Redis
-    match redis_fns::get_oauth_token_in_redis(oauth_token).await {
-        Ok(is_oauth_token_in_redis) => {
-            if is_oauth_token_in_redis {
-                let err_msg = format!(
-                    "Error: oauth_token {oauth_token} has already been used to register an account. \
-                    You can only register 1 account per oauth_token",
-                );
-                warn!("{err_msg}");
-                return (StatusCode::BAD_REQUEST, err_msg).into_response();
-            }
-        }
-        Err(err) => {
-            let err_msg = format!(
-                "Error getting oauth_token for account_id {account_id}, oauth_token {oauth_token} in Relayer DB: {err:?}",
-            );
-            error!("{err_msg}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-        }
-    }
-    let redis_result = redis_fns::set_account_and_allowance_in_redis(
-        account_id,
-        allowance_in_gas,
-    ).await;
-
-    let Ok(_) = redis_result else {
-        let err_msg = format!(
-            "Error creating account_id {account_id} with allowance {allowance_in_gas} in Relayer DB:\n{redis_result:?}"
-        );
-        error!("{err_msg}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-    };
-
-    /*
         call process_signed_delegate_action fn
         if there's an error, then return error
         if it succeeds, then add oauth token to redis and allocate shared storage
@@ -434,179 +290,18 @@ async fn create_account_atomic(
         return (StatusCode::BAD_REQUEST, err_msg).into_response();
     };
 
-    // allocate shared storage for account_id if shared storage is being used
-    if USE_FASTAUTH_FEATURES.clone() || USE_SHARED_STORAGE.clone() {
-        if let Err(err) = SHARED_STORAGE_POOL.allocate_default(account_id.clone()).await {
-            let err_msg = format!("Error allocating storage for account {account_id}: {err:?}");
-            error!("{err_msg}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-        }
-    }
-
-    // add oauth token to redis (key: oauth_token, val: true)
-    match redis_fns::set_oauth_token_in_redis(oauth_token.clone()).await {
-        Ok(_) => {
-            let ok_msg = format!(
-                "Added Oauth token {oauth_token:?} for account_id {account_id:?} \
-                with allowance (in Gas) {allowance_in_gas:?} to Relayer DB. \
-                Near onchain account creation response: {create_account_sda_result:?}"
-            );
-            info!("{ok_msg}");
-            (
-                StatusCode::CREATED,
-                ok_msg,
-            ).into_response()
-        }
-        Err(err) => {
-            let err_msg = format!(
-                "Error creating oauth token {oauth_token:?} in Relayer DB:\n{err:?}",
-            );
-            error!("{err_msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
-        }
-    }
-}
-
-
-#[utoipa::path(
-post,
-    path = "/update_allowance",
-    request_body = AccountIdAllowanceJson,
-    responses(
-        (status = 201, description = "Relayer DB updated for {account_id: example.near,allowance: 90000000000000}", body = String),
-        (status = 500, description = "Error updating account_id example.near with allowance 90000000000000 in Relayer DB:\
-                    \n{db_result:?}", body = String),
-    ),
-)]
-async fn update_allowance(
-    account_id_allowance: Json<AccountIdAllowanceJson>
-) -> impl IntoResponse {
-    let account_id: &String = &account_id_allowance.account_id;
-    let allowance_in_gas: &u64 = &account_id_allowance.allowance;
-
-    let redis_result = redis_fns::set_account_and_allowance_in_redis(
-        account_id,
-        allowance_in_gas,
-    ).await;
-
-    let Ok(_) = redis_result else {
-        let err_msg = format!(
-            "Error updating account_id {account_id} with allowance {allowance_in_gas} in Relayer DB:\
-            \n{redis_result:?}"
-        );
-        warn!("{err_msg}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-    };
-    let success_msg: String = format!("Relayer DB updated for {account_id_allowance:?}");
-    info!("success_msg");
+    let ok_msg = format!(
+        "Added Oauth token {oauth_token:?} for account_id {account_id:?} \
+        with allowance (in Gas) {allowance_in_gas:?} to Relayer DB. \
+        Near onchain account creation response: {create_account_sda_result:?}"
+    );
+    info!("{ok_msg}");
     (
         StatusCode::CREATED,
-        success_msg
+        ok_msg,
     ).into_response()
 }
 
-
-#[utoipa::path(
-    post,
-    path = "/update_all_allowances",
-    request_body = AllowanceJson,
-    responses(
-        (status = 200, description = "Updated 321 keys in Relayer DB", body = String),
-        (status = 500, description = "Error updating allowance for key example.near: err_msg", body = String),
-    ),
-)]
-async fn update_all_allowances(
-    Json(allowance_json): Json<AllowanceJson>,
-) -> impl IntoResponse {
-    let allowance_in_gas = allowance_json.allowance_in_gas;
-    let redis_response = update_all_allowances_in_redis(allowance_in_gas).await;
-    match redis_response {
-        Ok(response) => response.into_response(),
-        Err(err) => (err.status_code, err.message).into_response(),
-    }
-}
-
-
-#[utoipa::path(
-    post,
-    path = "/register_account_and_allowance",
-    request_body = AccountIdAllowanceOauthJson,
-    responses(
-        (status = 201, description = "Added Oauth token {oauth_token: https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2, account_id: example.near, allowance: 90000000000000 to Relayer DB", body = String),
-        (status = 500, description = "Error: oauth_token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 has already been used to register an account. \
-                            You can only register 1 account per oauth_token", body = String),
-    ),
-)]
-async fn register_account_and_allowance(
-    account_id_allowance_oauth: Json<AccountIdAllowanceOauthJson>
-) -> impl IntoResponse {
-    let account_id: &String = &account_id_allowance_oauth.account_id;
-    let allowance_in_gas: &u64 = &account_id_allowance_oauth.allowance;
-    let oauth_token: &String = &account_id_allowance_oauth.oauth_token;
-    // check if the oauth_token has already been used and is a key in Relayer DB
-    match redis_fns::get_oauth_token_in_redis(oauth_token).await {
-        Ok(is_oauth_token_in_redis) => {
-            if is_oauth_token_in_redis {
-                let err_msg = format!(
-                    "Error: oauth_token {oauth_token} has already been used to register an account. \
-                    You can only register 1 account per oauth_token",
-                );
-                warn!("{err_msg}");
-                return (StatusCode::BAD_REQUEST, err_msg).into_response();
-            }
-        }
-        Err(err) => {
-            let err_msg = format!(
-                "Error getting oauth_token for account_id {account_id}, \
-                oauth_token {oauth_token} in Relayer DB: {err:?}",
-            );
-            error!("{err_msg}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-        }
-    }
-    let redis_result = redis_fns::set_account_and_allowance_in_redis(
-        account_id,
-        allowance_in_gas,
-    ).await;
-
-    let Ok(_) = redis_result else {
-        let err_msg = format!(
-            "Error creating account_id {account_id} with allowance {allowance_in_gas} in Relayer DB:\
-            \n{redis_result:?}");
-        error!("{err_msg}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-    };
-
-    let Ok(account_id) = account_id.parse::<AccountId>() else {
-        let err_msg = format!("Invalid account_id: {account_id}");
-        warn!("{err_msg}");
-        return (StatusCode::BAD_REQUEST, err_msg).into_response();
-    };
-    if let Err(err) = SHARED_STORAGE_POOL.allocate_default(account_id.clone()).await {
-        let err_msg = format!("Error allocating storage for account {account_id}: {err:?}");
-        error!("{err_msg}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
-    }
-
-    // add oauth token to redis (key: oauth_token, val: true)
-    match redis_fns::set_oauth_token_in_redis(oauth_token.clone()).await {
-        Ok(_) => {
-            let ok_msg = format!("Added Oauth token {account_id_allowance_oauth:?} to Relayer DB");
-            info!("{ok_msg}");
-            (
-                StatusCode::CREATED,
-                ok_msg,
-            ).into_response()
-        }
-        Err(err) => {
-            let err_msg = format!(
-                "Error creating oauth token {oauth_token:?} in Relayer DB:\n{err:?}",
-            );
-            error!("{err_msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
-        }
-    }
-}
 
 #[utoipa::path(
     post,
@@ -662,6 +357,7 @@ async fn send_meta_tx(
     }
 }
 
+
 async fn process_signed_delegate_action(
     signed_delegate_action: SignedDelegateAction,
 ) -> Result<String, RelayError> {
@@ -673,62 +369,6 @@ async fn process_signed_delegate_action(
     let receiver_id = signed_delegate_action.delegate_action.sender_id.clone();
     let da_receiver_id = signed_delegate_action.delegate_action.receiver_id.clone();
 
-    // check that the delegate action receiver_id is in the whitelisted_contracts
-    let is_whitelisted_da_receiver = WHITELISTED_CONTRACTS.iter().any(
-        |s| s == da_receiver_id.as_str()
-    );
-    // check the sender_id in whitelist if applicable
-    if USE_WHITELISTED_DELEGATE_ACTION_RECEIVER_IDS.clone() && !USE_FASTAUTH_FEATURES.clone() {
-        // check if the delegate action receiver_id (account sender_id) if a whitelisted delegate action receiver
-        let is_whitelisted_sender = WHITELISTED_DELEGATE_ACTION_RECEIVER_IDS.iter().any(
-            |s| s == receiver_id.as_str()
-        );
-        if !is_whitelisted_sender {
-            let err_msg = format!(
-                "Delegate Action receiver_id {} or sender_id {} is not whitelisted",
-                da_receiver_id.as_str(),
-                receiver_id.as_str(),
-            );
-            warn!("{err_msg}");
-            return Err(RelayError {
-                status_code: StatusCode::BAD_REQUEST,
-                message: err_msg
-            });
-        }
-    }
-    if !is_whitelisted_da_receiver && USE_FASTAUTH_FEATURES.clone() {
-        // check if sender id and receiver id are the same AND (AddKey or DeleteKey action)
-        let non_delegate_action = signed_delegate_action.delegate_action.actions.get(0).ok_or_else(|| {
-            let err_msg = format!(
-                "DelegateAction must have at least one NonDelegateAction"
-            );
-            warn!("{err_msg}");
-            RelayError {
-                status_code: StatusCode::BAD_REQUEST,
-                message: err_msg,
-            }
-        })?;
-        let contains_key_action = matches!(
-            (*non_delegate_action).clone().into(), Action::AddKey(_) | Action::DeleteKey(_)
-        );
-        // check if the receiver_id (delegate action sender_id) if a whitelisted delegate action receiver
-        let is_whitelisted_sender = WHITELISTED_DELEGATE_ACTION_RECEIVER_IDS.iter().any(
-            |s| s == receiver_id.as_str()
-        );
-        if (receiver_id != da_receiver_id || !contains_key_action) && !is_whitelisted_sender {
-            let err_msg = format!(
-                "Delegate Action receiver_id {} or sender_id {} is not whitelisted OR \
-                (they do not match AND the NonDelegateAction is not AddKey or DeleteKey)",
-                da_receiver_id.as_str(),
-                receiver_id.as_str(),
-            );
-            warn!("{err_msg}");
-            return Err(RelayError {
-                status_code: StatusCode::BAD_REQUEST,
-                message: err_msg
-            });
-        }
-    }
 
     // Check if the SignedDelegateAction includes a FunctionCallAction that transfers FTs to BURN_ADDRESS
     if USE_PAY_WITH_FT.clone() {
@@ -751,204 +391,50 @@ async fn process_signed_delegate_action(
         }
     }
 
-    if USE_REDIS.clone() {
-        // Check the sender's remaining gas allowance in Redis
-        let end_user_account: &AccountId = &signed_delegate_action.delegate_action.sender_id;
-        let remaining_allowance: u64 = redis_fns::get_remaining_allowance(end_user_account).await.unwrap_or(0);
-        if remaining_allowance < TXN_GAS_ALLOWANCE {
-            let err_msg = format!(
-                "AccountId {} does not have enough remaining gas allowance.",
-                end_user_account.as_str()
-            );
+
+    let actions = vec![Action::Delegate(signed_delegate_action)];
+    let execution = RPC_CLIENT.send_tx(&*SIGNER, &receiver_id, actions)
+        .await
+        .map_err(|err| {
+            let err_msg = format!("Error signing transaction: {err:?}");
             error!("{err_msg}");
-            return Err(RelayError {
-                status_code: StatusCode::BAD_REQUEST,
+            RelayError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
                 message: err_msg,
-            });
+            }
+        })?;
+
+    let status = &execution.status;
+    let mut response_msg: String = "".to_string();
+    match status {
+        near_primitives::views::FinalExecutionStatus::Failure(_) => {
+            response_msg = "Error sending transaction".to_string();
         }
-
-        let actions = vec![Action::Delegate(signed_delegate_action)];
-        let execution = RPC_CLIENT.send_tx(&*SIGNER, &receiver_id, actions)
-            .await
-            .map_err(|err| {
-                let err_msg = format!("Error signing transaction: {err:?}");
-                error!("{err_msg}");
-                RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err_msg,
-                }
-            })?;
-
-        let status = &execution.status;
-        let mut response_msg: String = "".to_string();
-        match status {
-            near_primitives::views::FinalExecutionStatus::Failure(_) => {
-                response_msg = "Error sending transaction".to_string();
-            }
-            _ => {
-                response_msg = "Relayed and sent transaction".to_string();
-            }
-        }
-        let status_msg = json!({
-            "message": response_msg,
-            "status": &execution.status,
-            "Transaction Outcome": &execution.transaction_outcome,
-            "Receipts Outcome": &execution.receipts_outcome,
-        });
-
-        let gas_used_in_yn = redis_fns::calculate_total_gas_burned(
-            execution.transaction_outcome,
-            execution.receipts_outcome,
-        );
-        debug!("total gas burnt in yN: {}", gas_used_in_yn);
-        let new_allowance = redis_fns::update_remaining_allowance(
-            &signer_account_id,
-            gas_used_in_yn,
-            remaining_allowance
-        )
-            .await
-            .map_err(|err| {
-                let err_msg = format!(
-                    "Updating redis remaining allowance errored out: {err:?}"
-                );
-                error!("{err_msg}");
-                RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err_msg,
-                }
-            })?;
-        info!("Updated remaining allowance for account {signer_account_id}: {new_allowance}",);
-
-        match status {
-            near_primitives::views::FinalExecutionStatus::Failure(_) => {
-                error!("Error message: \n{status_msg:?}");
-                Err(RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: status_msg.to_string(),
-                })
-            }
-            _ => {
-                info!("Success message: \n{status_msg:?}");
-                Ok(status_msg.to_string())
-            }
-        }
-
-    } else {
-        let actions = vec![Action::Delegate(signed_delegate_action)];
-        let execution = RPC_CLIENT.send_tx(&*SIGNER, &receiver_id, actions)
-            .await
-            .map_err(|err| {
-                let err_msg = format!("Error signing transaction: {err:?}");
-                error!("{err_msg}");
-                RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err_msg,
-                }
-            })?;
-
-        let status = &execution.status;
-        let mut response_msg: String = "".to_string();
-        match status {
-            near_primitives::views::FinalExecutionStatus::Failure(_) => {
-                response_msg = "Error sending transaction".to_string();
-            }
-            _ => {
-                response_msg = "Relayed and sent transaction".to_string();
-            }
-        }
-        let status_msg = json!({
-            "message": response_msg,
-            "status": &execution.status,
-            "Transaction Outcome": &execution.transaction_outcome,
-            "Receipts Outcome": &execution.receipts_outcome,
-        });
-
-        match status {
-            near_primitives::views::FinalExecutionStatus::Failure(_) => {
-                error!("Error message: \n{status_msg:?}");
-                Err(RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: status_msg.to_string(),
-                })
-            }
-            _ => {
-                info!("Success message: \n{status_msg:?}");
-                Ok(status_msg.to_string())
-            }
+        _ => {
+            response_msg = "Relayed and sent transaction".to_string();
         }
     }
-}
+    let status_msg = json!({
+        "message": response_msg,
+        "status": &execution.status,
+        "Transaction Outcome": &execution.transaction_outcome,
+        "Receipts Outcome": &execution.receipts_outcome,
+    });
 
-pub async fn get_redis_cnxn() -> Result<PooledConnection<RedisConnectionManager>, RedisError> {
-    let conn_result = REDIS_POOL.get();
-    let conn: PooledConnection<RedisConnectionManager> = match conn_result {
-        Ok(conn) => conn,
-        Err(e) => {
-            let err_msg = format!("Error getting Relayer DB connection from the pool");
-            error!("{err_msg}");
-            return Err(RedisError::from((
-                IoError,
-                "Error getting Relayer DB connection from the pool",
-                e.to_string(),
-            )));
-        }
-    };
-    Ok(conn)
-}
-
-pub async fn update_all_allowances_in_redis(allowance_in_gas: u64) -> Result<String, RelayError> {
-    // Get a connection to Redis from the pool
-    let mut redis_conn = match get_redis_cnxn().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            let err_msg = format!("Error getting Relayer DB connection from the pool: {}", e);
-            error!("{err_msg}");
-            return Err(RelayError {
+    match status {
+        near_primitives::views::FinalExecutionStatus::Failure(_) => {
+            error!("Error message: \n{status_msg:?}");
+            Err(RelayError {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                message: err_msg
-            });
+                message: status_msg.to_string(),
+            })
         }
-    };
-
-    // Fetch all keys that match the network env (.near for mainnet, .testnet for testnet, etc)
-    let network: String = if NETWORK_ENV.clone() != "mainnet" {
-        NETWORK_ENV.clone()
-    } else {
-        "near".to_string()
-    };
-    let pattern = format!("*.{}", network);
-    let keys: Vec<String> = match redis_conn.keys(pattern) {
-        Ok(keys) => keys,
-        Err(e) => {
-            let err_msg = format!("Error fetching keys from Relayer DB: {}", e);
-            error!("{err_msg}");
-            return Err(RelayError {
-                status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                message: err_msg
-            });
-        }
-    };
-
-    // Iterate through the keys and update their values to the provided allowance in gas
-    for key in &keys {
-        match redis_conn.set::<_, _, ()>(key, allowance_in_gas.to_string()) {
-            Ok(_) => info!("Updated allowance for key {}", key),
-            Err(e) => {
-                let err_msg = format!("Error updating allowance for key {}: {}", key, e);
-                error!("{err_msg}");
-                return Err(RelayError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: err_msg
-                });
-            }
+        _ => {
+            info!("Success message: \n{status_msg:?}");
+            Ok(status_msg.to_string())
         }
     }
-
-    // Return a success response
-    let num_keys = keys.len();
-    let success_msg: String = format!("Updated {num_keys:?} keys in Relayer DB");
-    info!("{success_msg}");
-    Ok(success_msg)
+    
 }
 
 /**
@@ -1004,9 +490,6 @@ async fn test_send_meta_tx() {   // tests assume testnet in config
 
     // simulate calling the '/update_allowance' function with sender_id & allowance
     let allowance_in_gas: u64 = u64::MAX;
-    redis_fns::set_account_and_allowance_in_redis(&sender_id, &allowance_in_gas).await.expect(
-        "Failed to update account and allowance in redis"
-    );
 
     // Call the `/send_meta_tx` function happy path
     let signed_delegate_action = create_signed_delegate_action(
