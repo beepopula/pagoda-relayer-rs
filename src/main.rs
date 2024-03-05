@@ -414,12 +414,14 @@ async fn process_signed_delegate_action(
             response_msg = "Relayed and sent transaction".to_string();
         }
     }
-    let status_msg = json!({
-        "message": response_msg,
-        "status": &execution.status,
-        "Transaction Outcome": &execution.transaction_outcome,
-        "Receipts Outcome": &execution.receipts_outcome,
-    });
+    // let status_msg = json!({
+    //     "message": response_msg,
+    //     "status": &execution.status,
+    //     "Transaction Outcome": &execution.transaction_outcome,
+    //     "Receipts Outcome": &execution.receipts_outcome,
+    // });
+
+    let status_msg = json!(execution);
 
     match status {
         near_primitives::views::FinalExecutionStatus::Failure(_) => {
