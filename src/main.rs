@@ -28,7 +28,7 @@ use near_primitives::types::AccountId;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::json;
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, str::FromStr};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::SocketAddr;
 use std::string::ToString;
@@ -88,44 +88,28 @@ static BURN_ADDRESS: Lazy<String> = Lazy::new(||{
    LOCAL_CONF.get("burn_address").unwrap()
 });
 
-#[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AccountIdAllowanceSDAJson {
-    #[schema(example = "example.near")]
-    account_id: String,
-    #[schema(example = 900000000)]
-    allowance: u64,
-    signed_delegate_action: SignedDelegateAction,
-}
-impl Display for AccountIdAllowanceSDAJson {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "account_id: {}, allowance in Gas: {}, SDA: {}",
-            self.account_id, self.allowance, self.signed_delegate_action.signature
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AccountIdJson {
-    #[schema(example = "example.near")]
-    account_id: String,
-}
-impl Display for AccountIdJson {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "account_id: {}", self.account_id)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AllowanceJson {  // TODO: LP use for return type of GET get_allowance
-    #[schema(example = 900000000)]
-    allowance_in_gas: u64,
-}
-impl Display for AllowanceJson {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "allowance in Gas: {}", self.allowance_in_gas)
-    }
+// struct CreateAccountJson {
+//     "new_account_id: "hong994.near",
+//     "options": {
+//         "contract_bytes": null,
+//         "full_access_keys": [
+//         "ed25519:7wyj8DLRfh985BpjZNKypTFcLGMc3sY8JrhSADjiKGFc"
+//         ],
+//         "limited_access_keys": [
+//         {
+//             "allowance": "250000000000000",
+//             "method_names": "find_grants",
+//             "public_key": "ed25519:6nhXvbN9JyDKALUK8uBrViWYpZexQd2E17TUC12KdXLm",
+//             "receiver_id": "social.near"
+//         }
+//         ]
+//     }
+      
+// }
+#[derive(Debug, Clone, Deserialize)]
+struct Transaction {
+    receiver_id: AccountId,
+    actions: Vec<Action>
 }
 
 
@@ -137,41 +121,8 @@ async fn main() {
     //TODO: not secure, allow only for testnet, whitelist endpoint etc. for mainnet
     let cors_layer = tower_http::cors::CorsLayer::permissive();
 
-    #[derive(OpenApi)]
-    #[openapi(
-        info(
-            title = "relayer",
-            description = "APIs for creating accounts, managing allowances, and relaying meta transactions. \
-                    \n NOTE: the SignedDelegateAction is not supported by the openapi schema. \
-                    \n Here's an example json of a SignedDelegateAction payload:\
-                    \n ```{\"delegate_action\": {\"actions\": [{\"Transfer\": {\"deposit\": \"1\" }}], \"max_block_height\": 922790412, \"nonce\": 103066617000686, \"public_key\": \"ed25519:98GtfFzez3opomVpwa7i4m2nptHtc8Ha405XHMWszQtL\", \"receiver_id\": \"relayer.example.testnet\", \"sender_id\": \"example.testnet\" }, \"signature\": \"ed25519:4uJu8KapH98h8cQm4btE0DKnbiFXSZNT7McDw4LHy7pdAt4Mz8DfuyQZadGgFExo77or9152iwcw2q12rnFWa6bg\" }``` \
-                    \n For more details on the SignedDelegateAction data structure, please see https://docs.rs/near-primitives/latest/near_primitives/delegate_action/struct.SignedDelegateAction.html or https://docs.near.org/develop/relayers/build-relayer#signing-a-delegated-transaction "
-        ),
-        paths(
-            relay,
-            send_meta_tx,
-            create_account,
-        ),
-        components(
-            schemas(
-                RelayError,
-                AllowanceJson,
-                AccountIdJson,
-                AccountIdAllowanceSDAJson,
-            )
-        ),
-        tags((
-            name = "relayer",
-            description = "APIs for creating accounts, managing allowances, \
-                                    and relaying meta transactions"
-        )),
-    )]
-    struct ApiDoc;
-
     // build our application with a route
     let app = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui")
-            .url("/api-docs/openapi.json", ApiDoc::openapi()))
         // There is no need to create `RapiDoc::with_openapi` because the OpenApi is served
         // via SwaggerUi instead we only make rapidoc to point to the existing doc.
         .merge(RapiDoc::new("/api-docs/openapi.json").path("/rapidoc"))
@@ -179,7 +130,7 @@ async fn main() {
         // .merge(RapiDoc::with_openapi("/api-docs/openapi2.json", ApiDoc::openapi()).path("/rapidoc"))
         // `POST /relay` goes to `relay` handler function
         .route("/relay", post(relay))
-        .route("/send_meta_tx", post(send_meta_tx))
+        .route("/send_tx", post(send_tx))
         .route("/create_account", post(create_account))
         // See https://docs.rs/tower-http/0.1.1/tower_http/trace/index.html for more details.
         .layer(TraceLayer::new_for_http())
@@ -193,64 +144,6 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
-}
-
-
-// TODO: LP how to get multiple 500 status messages to show up
-#[utoipa::path(
-    post,
-    path = "/create_account",
-    request_body = AccountIdAllowanceSDAJson,
-    responses(
-        (status = 201, description = "Added Oauth token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 for account_id example.near \
-                            with allowance (in Gas) 90000000000000 to Relayer DB. \
-                            Near onchain account creation response: {create_account_sda_result:?}", body = String),
-        (status = 400, description = "Error: oauth_token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 has already been used to register an account. You can only register 1 account per oauth_token", body = String),
-        (status = 403, description = "Invalid account_id: invalid_account_id.near", body = String),
-        (status = 500, description = "Error getting oauth_token for account_id example.near, oauth_token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 in Relayer DB: err_msg", body = String),
-        (status = 500, description = "Error creating account_id example.near with allowance 90000000000000 in Relayer DB:\nerr_msg", body = String),
-        (status = 500, description = "Error allocating storage for account example.near: err_msg", body = String),
-        (status = 500, description = "Error creating oauth token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 in Relayer DB:\n{err:?}", body = String),
-    ),
-)]
-async fn create_account(
-    account_id_allowance_sda: Json<AccountIdAllowanceSDAJson>
-) -> impl IntoResponse {
-    /*
-    This function atomically creates an account, both in our systems (redis)
-    and on chain created both an on chain account and adding that account to the storage pool
-
-    Motivation for doing this is when calling /register_account_and_allowance and then /send_meta_tx and
-    /register_account_and_allowance succeeds, but /send_meta_tx fails, then the account is now
-    unable to use the relayer without manual intervention deleting the record from redis
-     */
-
-    // get individual vars from json object
-    let account_id: &String = &account_id_allowance_sda.account_id;
-    let allowance_in_gas: &u64 = &account_id_allowance_sda.allowance;
-    let sda = account_id_allowance_sda.signed_delegate_action.clone();
-
-    /*
-        call process_signed_delegate_action fn
-        if there's an error, then return error
-        if it succeeds, then add oauth token to redis and allocate shared storage
-        after updated redis and adding shared storage, finally return success msg
-     */
-    let create_account_sda_result = process_signed_delegate_action(sda).await;
-    if create_account_sda_result.is_err() {
-        let err: RelayError = create_account_sda_result.err().unwrap();
-        return (err.status_code, err.message).into_response();
-    }
-    let Ok(account_id) = account_id.parse::<AccountId>() else {
-        let err_msg = format!("Invalid account_id: {account_id}");
-        warn!("{err_msg}");
-        return (StatusCode::BAD_REQUEST, err_msg).into_response();
-    };
-
-    (
-        StatusCode::CREATED,
-        "ok".to_string(),
-    ).into_response()
 }
 
 
@@ -287,24 +180,98 @@ async fn relay(
 
 #[utoipa::path(
     post,
-    path = "/send_meta_tx",
-    request_body = SignedDelegateAction,
+    path = "/create_account",
+    request_body = String,
     responses(
         (status = 201, description = "Relayed and sent transaction ...", body = String),
         (status = 400, description = "Error deserializing payload data object ...", body = String),
         (status = 500, description = "Error signing transaction: ...", body = String),
     ),
 )]
-async fn send_meta_tx(
-    data: Json<SignedDelegateAction>,
+async fn create_account(
+    args: Json<String>,
 ) -> impl IntoResponse {
-    let relayer_response = process_signed_delegate_action(
+    let args = args.0.as_bytes().to_vec();
+    let relayer_response = process_transaction(
         // deserialize SignedDelegateAction using serde json
-        data.0,
+        AccountId::from_str("near").unwrap(),
+        vec![
+            Action::from(FunctionCallAction { 
+                method_name: "create_account_advanced".to_string(), 
+                args, 
+                gas: 300000000000000, 
+                deposit: 0 
+            })
+        ]
     ).await;
     match relayer_response {
         Ok(response) => response.into_response(),
         Err(err) => (err.status_code, err.message).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/send_tx",
+    request_body = Transaction,
+    responses(
+        (status = 201, description = "Relayed and sent transaction ...", body = String),
+        (status = 400, description = "Error deserializing payload data object ...", body = String),
+        (status = 500, description = "Error signing transaction: ...", body = String),
+    ),
+)]
+async fn send_tx(
+    data: Json<Transaction>,
+) -> impl IntoResponse {
+    let data = data.0;
+    let relayer_response = process_transaction(
+        // deserialize SignedDelegateAction using serde json
+        data.receiver_id,
+        data.actions
+    ).await;
+    match relayer_response {
+        Ok(response) => response.into_response(),
+        Err(err) => (err.status_code, err.message).into_response(),
+    }
+}
+
+async fn process_transaction(
+    receiver_id: AccountId,
+    actions: Vec<Action>
+) -> Result<String, RelayError> {
+    
+    let execution = RPC_CLIENT.send_tx(&*SIGNER, &receiver_id, actions)
+        .await
+        .map_err(|err| {
+            let err_msg = format!("Error signing transaction: {err:?}");
+            error!("{err_msg}");
+            RelayError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                message: err_msg,
+            }
+        })?;
+    let status = &execution.status;
+    // let status_msg = json!({
+    //     "message": response_msg,
+    //     "status": &execution.status,
+    //     "Transaction Outcome": &execution.transaction_outcome,
+    //     "Receipts Outcome": &execution.receipts_outcome,
+    // });
+
+    let status_msg = json!(execution);
+
+    match status {
+        near_primitives::views::FinalExecutionStatus::Failure(_) => {
+            error!("Error message: \n{status_msg:?}");
+            Err(RelayError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                message: status_msg.to_string(),
+            })
+        }
+        _ => {
+            info!("Success message: \n{status_msg:?}");
+            Ok(status_msg.to_string())
+        }
     }
 }
 
@@ -356,15 +323,6 @@ async fn process_signed_delegate_action(
         })?;
 
     let status = &execution.status;
-    let mut response_msg: String = "".to_string();
-    match status {
-        near_primitives::views::FinalExecutionStatus::Failure(_) => {
-            response_msg = "Error sending transaction".to_string();
-        }
-        _ => {
-            response_msg = "Relayed and sent transaction".to_string();
-        }
-    }
     // let status_msg = json!({
     //     "message": response_msg,
     //     "status": &execution.status,
@@ -430,64 +388,6 @@ async fn read_body_to_string(mut body: BoxBody) -> Result<String, Box<dyn std::e
     Ok(String::from_utf8(bytes.to_vec())?)
 }
 
-#[tokio::test]
-// NOTE: uncomment ignore locally to run test bc redis doesn't work in github action build env
-#[ignore]
-async fn test_send_meta_tx() {   // tests assume testnet in config
-    // Test Transfer Action
-    let actions = vec![Action::Transfer(TransferAction { deposit: 1 })];
-    let sender_id: String = String::from("relayer_test0.testnet");
-    let receiver_id: String = String::from("relayer_test1.testnet");
-    let nonce: i32 = 1;
-    let max_block_height = 2000000000;
-
-    // simulate calling the '/update_allowance' function with sender_id & allowance
-    let allowance_in_gas: u64 = u64::MAX;
-
-    // Call the `/send_meta_tx` function happy path
-    let signed_delegate_action = create_signed_delegate_action(
-        sender_id.clone(),
-        receiver_id.clone(),
-        actions.clone(),
-        nonce,
-        max_block_height,
-    );
-    let json_payload = Json(signed_delegate_action);
-    println!("SignedDelegateAction Json Serialized (no borsh): {:?}", json_payload);
-    let response: Response = send_meta_tx(json_payload).await.into_response();
-    let response_status: StatusCode = response.status();
-    let body: BoxBody = response.into_body();
-    let body_str: String = read_body_to_string(body).await.unwrap();
-    println!("Response body: {body_str:?}");
-    assert_eq!(response_status, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_send_meta_tx_no_gas_allowance() {
-    let actions = vec![Action::Transfer(TransferAction { deposit: 1 })];
-    let sender_id: String = String::from("relayer_test0.testnet");
-    let receiver_id: String = String::from("arrr_me_not_in_whitelist");
-    let nonce: i32 = 54321;
-    let max_block_height = 2000000123;
-
-    // Call the `send_meta_tx` function with a sender that has no gas allowance
-    // (and a receiver_id that isn't in whitelist)
-    let sda2 = create_signed_delegate_action(
-        sender_id.clone(),
-        receiver_id.clone(),
-        actions.clone(),
-        nonce,
-        max_block_height,
-    );
-    let non_whitelist_json_payload = Json(sda2);
-    println!("SignedDelegateAction Json Serialized (no borsh) receiver_id not in whitelist: {:?}", non_whitelist_json_payload);
-    let err_response = send_meta_tx(non_whitelist_json_payload).await.into_response();
-    let err_response_status = err_response.status();
-    let body: BoxBody = err_response.into_body();
-    let body_str: String = read_body_to_string(body).await.unwrap();
-    println!("Response body: {body_str:?}");
-    assert!(err_response_status == StatusCode::BAD_REQUEST || err_response_status == StatusCode::INTERNAL_SERVER_ERROR);
-}
 
 #[tokio::test]
 #[ignore]
