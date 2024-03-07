@@ -228,7 +228,7 @@ async fn create_account(
     // get individual vars from json object
     let account_id: &String = &account_id_allowance_sda.account_id;
     let allowance_in_gas: &u64 = &account_id_allowance_sda.allowance;
-    let sda = &account_id_allowance_sda.signed_delegate_action.clone();
+    let sda = account_id_allowance_sda.signed_delegate_action.clone();
 
     /*
         call process_signed_delegate_action fn
