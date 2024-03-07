@@ -181,7 +181,7 @@ async fn relay(
 #[utoipa::path(
     post,
     path = "/create_account",
-    request_body = String,
+    request_body = Vec<u8>,
     responses(
         (status = 201, description = "Relayed and sent transaction ...", body = String),
         (status = 400, description = "Error deserializing payload data object ...", body = String),
@@ -189,9 +189,9 @@ async fn relay(
     ),
 )]
 async fn create_account(
-    args: Json<String>,
+    args: Json<Vec<u8>>,
 ) -> impl IntoResponse {
-    let args = args.0.as_bytes().to_vec();
+    let args = args.0;
     let relayer_response = process_transaction(
         // deserialize SignedDelegateAction using serde json
         AccountId::from_str("near").unwrap(),
