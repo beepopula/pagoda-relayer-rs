@@ -89,59 +89,19 @@ static BURN_ADDRESS: Lazy<String> = Lazy::new(||{
 });
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AccountIdAllowanceOauthSDAJson {
+struct AccountIdAllowanceSDAJson {
     #[schema(example = "example.near")]
     account_id: String,
     #[schema(example = 900000000)]
     allowance: u64,
-    #[schema(example = "https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2")]
-    oauth_token: String,
-    // NOTE: imported SignedDelegateAction itself doesn't have a corresponding schema in the OpenAPI document
-    #[schema(example = "{\"delegate_action\": {\"actions\": [{\"Transfer\": {\"deposit\": \"1\" }}], \"max_block_height\": 922790412, \"nonce\": 103066617000686, \"public_key\": \"ed25519:98GtfFzez3opomVpwa7i4m2nptHtc8Ha405XHMWszQtL\", \"receiver_id\": \"relayer.example.testnet\", \"sender_id\": \"example.testnet\" }, \"signature\": \"ed25519:4uJu8KapH98h8cQm4btE0DKnbiFXSZNT7McDw4LHy7pdAt4Mz8DfuyQZadGgFExo77or9152iwcw2q12rnFWa6bg\" }")]
     signed_delegate_action: SignedDelegateAction,
 }
-impl Display for AccountIdAllowanceOauthSDAJson {
+impl Display for AccountIdAllowanceSDAJson {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "account_id: {}, allowance in Gas: {}, oauth_token: {}, signed_delegate_action signature: {}",
-            self.account_id, self.allowance, self.oauth_token, self.signed_delegate_action.signature
-        )  // SignedDelegateAction doesn't implement display, so just displaying signature
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AccountIdAllowanceOauthJson {
-    #[schema(example = "example.near")]
-    account_id: String,
-    #[schema(example = 900000000)]
-    allowance: u64,
-    #[schema(example = "https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2")]
-    oauth_token: String,
-}
-impl Display for AccountIdAllowanceOauthJson {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "account_id: {}, allowance in Gas: {}, oauth_token: {}",
-            self.account_id, self.allowance, self.oauth_token
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, ToSchema)]
-struct AccountIdAllowanceJson {
-    #[schema(example = "example.near")]
-    account_id: String,
-    #[schema(example = 900000000)]
-    allowance: u64,
-}
-impl Display for AccountIdAllowanceJson {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "account_id: {}, allowance in Gas: {}",
-            self.account_id, self.allowance
+            "account_id: {}, allowance in Gas: {}, SDA: {}",
+            self.account_id, self.allowance, self.signed_delegate_action
         )
     }
 }
@@ -190,16 +150,14 @@ async fn main() {
         paths(
             relay,
             send_meta_tx,
-            create_account_atomic,
+            create_account,
         ),
         components(
             schemas(
                 RelayError,
                 AllowanceJson,
                 AccountIdJson,
-                AccountIdAllowanceJson,
-                AccountIdAllowanceOauthJson,
-                AccountIdAllowanceOauthSDAJson,
+                AccountIdAllowanceSDAJson,
             )
         ),
         tags((
@@ -222,7 +180,7 @@ async fn main() {
         // `POST /relay` goes to `relay` handler function
         .route("/relay", post(relay))
         .route("/send_meta_tx", post(send_meta_tx))
-        .route("/create_account_atomic", post(create_account_atomic))
+        .route("/create_account", post(create_account))
         // See https://docs.rs/tower-http/0.1.1/tower_http/trace/index.html for more details.
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer);
@@ -241,8 +199,8 @@ async fn main() {
 // TODO: LP how to get multiple 500 status messages to show up
 #[utoipa::path(
     post,
-    path = "/create_account_atomic",
-    request_body = AccountIdAllowanceOauthSDAJson,
+    path = "/create_account",
+    request_body = AccountIdAllowanceSDAJson,
     responses(
         (status = 201, description = "Added Oauth token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 for account_id example.near \
                             with allowance (in Gas) 90000000000000 to Relayer DB. \
@@ -255,8 +213,8 @@ async fn main() {
         (status = 500, description = "Error creating oauth token https://securetoken.google.com/pagoda-oboarding-dev:Op4h13AQozM4CikngfHiFVC2xhf2 in Relayer DB:\n{err:?}", body = String),
     ),
 )]
-async fn create_account_atomic(
-    account_id_allowance_oauth_sda: Json<AccountIdAllowanceOauthSDAJson>
+async fn create_account(
+    account_id_allowance_sda: Json<AccountIdAllowanceSDAJson>
 ) -> impl IntoResponse {
     /*
     This function atomically creates an account, both in our systems (redis)
@@ -268,10 +226,9 @@ async fn create_account_atomic(
      */
 
     // get individual vars from json object
-    let account_id: &String = &account_id_allowance_oauth_sda.account_id;
-    let allowance_in_gas: &u64 = &account_id_allowance_oauth_sda.allowance;
-    let oauth_token: &String = &account_id_allowance_oauth_sda.oauth_token;
-    let sda: SignedDelegateAction = account_id_allowance_oauth_sda.signed_delegate_action.clone();
+    let account_id: &String = &account_id_allowance_sda.account_id;
+    let allowance_in_gas: &u64 = &account_id_allowance_sda.allowance;
+    let sda = &account_id_allowance_sda.signed_delegate_action;
 
     /*
         call process_signed_delegate_action fn
@@ -290,12 +247,6 @@ async fn create_account_atomic(
         return (StatusCode::BAD_REQUEST, err_msg).into_response();
     };
 
-    let ok_msg = format!(
-        "Added Oauth token {oauth_token:?} for account_id {account_id:?} \
-        with allowance (in Gas) {allowance_in_gas:?} to Relayer DB. \
-        Near onchain account creation response: {create_account_sda_result:?}"
-    );
-    info!("{ok_msg}");
     (
         StatusCode::CREATED,
         ok_msg,
