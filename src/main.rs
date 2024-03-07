@@ -15,7 +15,7 @@ use near_crypto::{KeyType, PublicKey, Signature};
 use near_fetch::signer::KeyRotatingSigner;
 #[cfg(test)]
 use near_primitives::borsh::BorshSerialize;
-use near_primitives::borsh::BorshDeserialize;
+use near_primitives::{borsh::BorshDeserialize, transaction::Transaction, types::{Gas, Balance}};
 #[cfg(test)]
 use near_primitives::delegate_action::{DelegateAction, NonDelegateAction};
 use near_primitives::delegate_action::SignedDelegateAction;
@@ -107,9 +107,12 @@ static BURN_ADDRESS: Lazy<String> = Lazy::new(||{
       
 // }
 #[derive(Debug, Clone, Deserialize)]
-struct Transaction {
+struct TransactionInput {
     receiver_id: AccountId,
-    actions: Vec<Action>
+    method_name: String,
+    args: Vec<u8>,
+    gas: String,
+    deposit: String
 }
 
 
@@ -213,7 +216,7 @@ async fn create_account(
 #[utoipa::path(
     post,
     path = "/send_tx",
-    request_body = Vec<u8>,
+    request_body = TransactionInput,
     responses(
         (status = 201, description = "Relayed and sent transaction ...", body = String),
         (status = 400, description = "Error deserializing payload data object ...", body = String),
@@ -221,13 +224,20 @@ async fn create_account(
     ),
 )]
 async fn send_tx(
-    data: Json<Vec<u8>>,
+    data: Json<TransactionInput>,
 ) -> impl IntoResponse {
-    let data = serde_json::from_slice::<Transaction>(&data.0).unwrap();
+    let data = data.0;
+    let receiver_id = data.receiver_id;
+    let actions = vec![Action::from(FunctionCallAction {
+        method_name: data.method_name,
+        args: data.args,
+        gas: Gas::from_str(&data.gas).unwrap(),
+        deposit: Balance::from_str(&data.deposit).unwrap()
+    })];
     let relayer_response = process_transaction(
         // deserialize SignedDelegateAction using serde json
-        data.receiver_id,
-        data.actions
+        receiver_id,
+        actions
     ).await;
     match relayer_response {
         Ok(response) => response.into_response(),
