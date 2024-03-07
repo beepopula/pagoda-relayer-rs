@@ -194,7 +194,7 @@ async fn create_account(
     let args = args.0;
     let relayer_response = process_transaction(
         // deserialize SignedDelegateAction using serde json
-        AccountId::from_str(LOCAL_CONF.get("suffix").unwrap()).unwrap(),
+        AccountId::from_str(&LOCAL_CONF.get::<String>("suffix").unwrap()).unwrap(),
         vec![
             Action::from(FunctionCallAction { 
                 method_name: "create_account_advanced".to_string(), 
