@@ -249,7 +249,7 @@ async fn create_account(
 
     (
         StatusCode::CREATED,
-        ok_msg,
+        "ok".to_string(),
     ).into_response()
 }
 
