@@ -101,7 +101,7 @@ impl Display for AccountIdAllowanceSDAJson {
         write!(
             f,
             "account_id: {}, allowance in Gas: {}, SDA: {}",
-            self.account_id, self.allowance, self.signed_delegate_action
+            self.account_id, self.allowance, self.signed_delegate_action.signature
         )
     }
 }
@@ -228,7 +228,7 @@ async fn create_account(
     // get individual vars from json object
     let account_id: &String = &account_id_allowance_sda.account_id;
     let allowance_in_gas: &u64 = &account_id_allowance_sda.allowance;
-    let sda = &account_id_allowance_sda.signed_delegate_action;
+    let sda = &account_id_allowance_sda.signed_delegate_action.clone();
 
     /*
         call process_signed_delegate_action fn
